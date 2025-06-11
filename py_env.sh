@@ -14,108 +14,97 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # --- Global Configuration Variables (Defaults - will be set after parsing) ---
-# These are initially defined as defaults. Their values might be updated by load_config
-# and then potentially overridden by command-line --path.
 DEFAULT_PYENV_STORAGE="$HOME/.pyenvs"
 LOG_FILE="$HOME/.pyenv_manager.log"
-CONFIG_FILE="$HOME/.config/pyenv_manager/config" # Default config file location
 
 SILENT_MODE=false # Default to non-silent mode
 FORCE_DELETE=false # Default to requiring confirmation for deletion
 
-# --- Helper Functions (MUST be defined before any calls to them) ---
 
+# --- Helper Functions for Logging and Output ---
+
+# Centralized logging and terminal output function
 log_message() {
     local type="$1"
-    local message="$2"
+    local raw_message="$2" # Message without color codes for logging
+    local colored_message="$3" # Message with color codes for terminal display
+
     # Ensure log file directory exists before writing
     mkdir -p "$(dirname "$LOG_FILE")" || error "Failed to create log directory: $(dirname "$LOG_FILE")"
-    echo -e "$(date '+%Y-%m-%d %H:%M:%S') [$type] $message" | tee -a "$LOG_FILE"
+
+    # Log to file (always raw, no colors)
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [$type] $raw_message" >> "$LOG_FILE"
+
+    # Print to terminal if not in silent mode
+    if ! $SILENT_MODE; then
+        echo -e "$colored_message"
+    fi
 }
 
 success() {
     local message="$1"
-    if ! $SILENT_MODE; then
-        echo -e "${GREEN}[SUCCESS]${NC} $message"
-    fi
-    log_message "SUCCESS" "$message"
+    log_message "SUCCESS" "[SUCCESS] $message" "${GREEN}[SUCCESS]${NC} $message"
 }
 
 info() {
     local message="$1"
-    if ! $SILENT_MODE; then
-        echo -e "${CYAN}[INFO]${NC} $message"
-    fi
-    log_message "INFO" "$message"
+    log_message "INFO" "[INFO] $message" "${CYAN}[INFO]${NC} $message"
 }
 
 warning() {
     local message="$1"
-    if ! $SILENT_MODE; then
-        echo -e "${YELLOW}[WARNING]${NC} $message"
-    fi
-    log_message "WARNING" "$message"
+    log_message "WARNING" "[WARNING] $message" "${YELLOW}[WARNING]${NC} $message"
 }
 
 error() {
     local message="$1"
-    echo -e "${RED}[ERROR]${NC} $message" # Always print errors to terminal
-    log_message "ERROR" "$message"
+    # Errors always print to terminal, regardless of SILENT_MODE
+    echo -e "${RED}[ERROR]${NC} $message"
+    log_message "ERROR" "[ERROR] $message" "${RED}[ERROR]${NC} $message" # Log error with color for consistency
     exit 1
 }
 
-# --- Function to load configuration ---
-# This function must be defined after helper functions that it calls (info, warning).
-# It will be called AFTER global options are parsed (so SILENT_MODE is correctly set).
-load_config() {
-    # Temporary variables to hold values sourced from config
-    local _cfg_storage_path=""
-    local _cfg_log_file=""
+# Function to compare version numbers (major.minor.patch)
+# Returns 0 if v1 >= v2, 1 if v1 < v2
+compare_versions() {
+    local v1="$1"
+    local v2="$2"
 
-    if [ -f "$CONFIG_FILE" ]; then
-        info "Loading configuration from ${CYAN}$CONFIG_FILE${NC}..."
+    # Normalize versions by replacing '-' with '.' and padding with .0 if needed
+    v1_norm=$(echo "$v1" | sed 's/-/./g' | awk -F'.' '{printf "%s.%s.%s", $1,$2,$3?$3:"0"}' )
+    v2_norm=$(echo "$v2" | sed 's/-/./g' | awk -F'.' '{printf "%s.%s.%s", $1,$2,$3?$3:"0"}' )
 
-        # Check if config file is readable.
-        if ! [ -r "$CONFIG_FILE" ]; then
-            warning "Configuration file ${CYAN}$CONFIG_FILE${NC} is not readable. Using default settings."
-            return 1 # Indicate failure to load
-        fi
-
-        # Source the config file. Temporarily disable 'set -u' to allow reading unset variables.
-        local old_set_u="$-" # Save current shell options
-        set +u              # Disable unset variable check
-        . "$CONFIG_FILE" || { warning "Failed to source configuration from ${CYAN}$CONFIG_FILE${NC}. Using defaults."; set "$old_set_u" -; return 1; }
-        if [[ "$old_set_u" =~ u ]]; then set -u; fi # Restore 'set -u' if it was previously enabled
-
-        # Check if the variables were set by the sourced config and assign to temp vars
-        if [ -n "${PYENV_STORAGE_PATH+x}" ]; then # ${var+x} checks if var is set (even if null)
-            _cfg_storage_path="$PYENV_STORAGE_PATH"
-        fi
-        if [ -n "${PYENV_LOG_FILE+x}" ]; then
-            _cfg_log_file="$PYENV_LOG_FILE"
-        fi
-
-        # Apply the loaded config values to the global variables
-        if [ -n "$_cfg_storage_path" ]; then
-            DEFAULT_PYENV_STORAGE="$_cfg_storage_path"
-        fi
-        if [ -n "$_cfg_log_file" ]; then
-            LOG_FILE="$_cfg_log_file"
-        fi
-        success "Configuration loaded."
+    if printf '%s\n%s\n' "$v1_norm" "$v2_norm" | sort -V -C; then
+        return 0 # v1 >= v2
     else
-        info "Configuration file not found at ${CYAN}$CONFIG_FILE${NC}. Using default settings."
-        # Ensure the config directory exists for potential future creation
-        mkdir -p "$(dirname "$CONFIG_FILE")" || warning "Failed to create config directory: $(dirname "$CONFIG_FILE")"
+        return 1 # v1 < v2
     fi
 }
 
 
 check_python_pip() {
     info "Checking for Python and pip..."
+
+    local install_needed=false
+
+    # --- Check Python 3 ---
     if ! command -v python3 &> /dev/null; then
-        warning "Python 3 not found. Attempting to install Python 3 and pip."
-        # Attempt to install Python 3 and pip based on common OS
+        warning "Python 3 not found. It will be installed."
+        install_needed=true
+    else
+        success "Python 3 is already installed."
+    fi
+
+    # --- Check pip3 ---
+    if ! command -v pip3 &> /dev/null; then
+        warning "pip3 not found. It will be installed."
+        install_needed=true
+    else
+        success "pip3 is already installed."
+    fi
+
+    if [ "$install_needed" = true ]; then
+        info "Attempting to install missing Python 3 and/or pip3."
         if command -v apt-get &> /dev/null; then
             info "Using apt-get to install python3 and python3-pip..."
             sudo apt-get update > /dev/null 2>&1 && sudo apt-get install -y python3 python3-pip || error "Failed to install python3 and python3-pip using apt-get."
@@ -127,35 +116,14 @@ check_python_pip() {
             sudo dnf install -y python3 python3-pip || error "Failed to install python3 and python3-pip using dnf."
         elif command -v pacman &> /dev/null; then
             info "Using pacman to install python and pip..."
+            # Arch uses 'python' for Python 3 by default, and 'python-pip'
             sudo pacman -Sy python python-pip || error "Failed to install python and pip using pacman."
         else
             error "Python 3 and pip not found, and cannot determine package manager to install them automatically. Please install Python 3 and pip manually."
         fi
-        success "Python 3 and pip installed successfully."
+        success "Python 3 and pip installation/check complete."
     else
-        success "Python 3 and pip are already installed."
-    fi
-
-    if ! command -v pip3 &> /dev/null; then
-        warning "pip3 not found. Attempting to install pip3."
-        if command -v apt-get &> /dev/null; then
-            info "Using apt-get to install python3-pip..."
-            sudo apt-get install -y python3-pip || error "Failed to install python3-pip using apt-get."
-        elif command -v yum &> /dev-null; then
-            info "Using yum to install python3-pip..."
-            sudo yum install -y python3-pip || error "Failed to install python3-pip using yum."
-        elif command -v dnf &> /dev/null; then
-            info "Using dnf to install python3-pip..."
-            sudo dnf install -y python3-pip || error "Failed to install python3-pip using dnf."
-        elif command -v pacman &> /dev/null; then
-            info "Using pacman to install python-pip..."
-            sudo pacman -Sy python-pip || error "Failed to install python-pip using pacman."
-        else
-            error "pip3 not found, and cannot determine package manager to install it automatically. Please install pip3 manually."
-        fi
-        success "pip3 installed successfully."
-    else
-        success "pip3 is already installed."
+        info "No core Python 3 or pip3 installation needed at this time."
     fi
 }
 
@@ -342,47 +310,143 @@ activate_env() {
         echo -e "${YELLOW}Please run the following command in your terminal:${NC}"
     fi
     echo -e "${GREEN}  source \"$env_path/bin/activate\"${NC}" # This output is always needed
-    log_message "INFO" "Activation command for '${env_name}': source \"$env_path/bin/activate\""
+    log_message "INFO" "Activation command for '${env_name}': source \"$env_path/bin/activate\"" "" # No color for log
 }
 
 check_python_update() {
-    info "Checking Python 3 installation status..."
+    info "Initiating Python and Pip update check..."
+
+    # --- Check Python 3 ---
     if ! command -v python3 &> /dev/null; then
-        warning "Python 3 is not installed on this system."
-        return 0
-    fi
+        warning "Python 3 is not installed on this system. Cannot check for updates."
+    else
+        local current_python_version=$(python3 --version 2>&1 | awk '{print $2}')
+        success "Current system Python 3 version: ${GREEN}$current_python_version${NC}"
 
-    local current_version=$(python3 --version 2>&1)
-    success "Current Python 3 version: ${GREEN}$current_version${NC}"
+        local package_manager=""
+        local python_package_name=""
+        local pip_package_name=""
 
-    if command -v apt-get &> /dev/null; then
-        info "Checking for available updates via apt..."
-        sudo apt-get update > /dev/null 2>&1
-        local upgradable_python=$(apt list --upgradable 2>/dev/null | grep -E '^python3/' | awk -F'/' '{print $1}')
-        if [ -n "$upgradable_python" ]; then
-            warning "An update for Python 3 (${upgradable_python}) is available in your apt repositories."
-            if ! $SILENT_MODE; then
-                info "You can update by running: ${YELLOW}sudo apt-get install python3${NC}"
+        if command -v apt-get &> /dev/null; then
+            package_manager="apt"
+            python_package_name="python3"
+            pip_package_name="python3-pip"
+            info "Running 'sudo apt-get update' to refresh package lists..."
+            sudo apt-get update > /dev/null 2>&1 || warning "Failed to update apt package lists."
+
+            local available_python_version=$(apt-cache policy python3 | grep Candidate | awk '{print $2}' | cut -d'-' -f1 || echo "")
+            if [ -n "$available_python_version" ]; then
+                info "Latest Python 3 version available via apt: ${CYAN}$available_python_version${NC}"
+                if compare_versions "$available_python_version" "$current_python_version"; then
+                    success "System Python 3 is already at or above the version available in apt repositories."
+                else
+                    warning "A newer Python 3 version (${available_python_version}) is available via apt."
+                    if ! $SILENT_MODE; then
+                        echo -e "${YELLOW}To upgrade system Python 3, run: ${PURPLE}sudo apt-get install --only-upgrade python3${NC}"
+                    fi
+                fi
+            else
+                info "Could not determine latest Python 3 version from apt repositories or no updates available."
+            fi
+
+        elif command -v yum &> /dev/null || command -v dnf &> /dev/null; then
+            package_manager=$(command -v dnf || echo "yum") # Prefer dnf if available
+            python_package_name="python3"
+            pip_package_name="python3-pip"
+            info "Running 'sudo $package_manager check-update' to refresh package lists..."
+            sudo $package_manager check-update > /dev/null 2>&1 || warning "Failed to check for updates with $package_manager."
+
+            local upgradable_python=$(sudo $package_manager list updates 2>/dev/null | grep -E "^python3\." | awk '{print $2}' | head -n 1 || echo "")
+            if [ -n "$upgradable_python" ]; then
+                warning "An update for Python 3 (${upgradable_python}) is available via $package_manager."
+                if ! $SILENT_MODE; then
+                    echo -e "${YELLOW}To upgrade system Python 3, run: ${PURPLE}sudo $package_manager update python3${NC}"
+                fi
+            else
+                success "System Python 3 is up to date in $package_manager repositories."
+            fi
+
+        elif command -v pacman &> /dev/null; then
+            package_manager="pacman"
+            python_package_name="python" # Arch Linux uses 'python' for Python 3
+            pip_package_name="python-pip"
+            info "Running 'sudo pacman -Sy' to refresh package lists..."
+            sudo pacman -Sy > /dev/null 2>&1 || warning "Failed to update pacman package lists."
+
+            local upgradable_python=$(pacman -Qu 2>/dev/null | grep -E "^python " | awk '{print $4}' | head -n 1 || echo "")
+            if [ -n "$upgradable_python" ]; then
+                warning "An update for Python 3 (${upgradable_python}) is available via pacman."
+                if ! $SILENT_MODE; then
+                    echo -e "${YELLOW}To upgrade system Python 3, run: ${PURPLE}sudo pacman -Syu${NC}"
+                fi
+            else
+                success "System Python 3 is up to date in pacman repositories."
             fi
         else
-            success "Python 3 is up to date in your apt repositories."
-        fi
-    elif command -v yum &> /dev/null || command -v dnf &> /dev/null; then
-        info "Cannot automatically check for Python 3 updates on this system's package manager (${YELLOW}yum/dnf${NC})."
-        if ! $SILENT_MODE; then
-            info "Please use '${YELLOW}sudo yum update python3${NC}' or '${YELLOW}sudo dnf update python3${NC}' to check for updates manually."
-        fi
-    elif command -v pacman &> /dev/null; then
-        info "Cannot automatically check for Python 3 updates on this system's package manager (${YELLOW}pacman${NC})."
-        if ! $SILENT_MODE; then
-            info "Please use '${YELLOW}sudo pacman -Syu python${NC}' to check for updates manually."
-        fi
-    else
-        info "Unable to determine system's package manager to check for Python 3 updates."
-        if ! $SILENT_MODE; then
-            info "Please consult your operating system's documentation for manual update checks."
+            info "Unable to determine system's package manager to check for Python 3 updates. Please check manually."
         fi
     fi
+
+    echo # Newline for readability
+
+    # --- Check pip3 ---
+    if ! command -v pip3 &> /dev/null; then
+        warning "pip3 is not installed on this system. Cannot check for updates."
+    else
+        local current_pip_version=$(pip3 --version 2>&1 | awk '{print $2}')
+        success "Current system pip3 version: ${GREEN}$current_pip_version${NC}"
+
+        info "Checking for pip3 updates via package manager..."
+        if [ -n "$package_manager" ]; then
+            if [ "$package_manager" = "apt" ]; then
+                local available_pip_version=$(apt-cache policy python3-pip | grep Candidate | awk '{print $2}' | cut -d'-' -f1 || echo "")
+                if [ -n "$available_pip_version" ]; then
+                    info "Latest pip3 version available via apt: ${CYAN}$available_pip_version${NC}"
+                    if compare_versions "$available_pip_version" "$current_pip_version"; then
+                        success "System pip3 is already at or above the version available in apt repositories."
+                    else
+                        warning "A newer pip3 version (${available_pip_version}) is available via apt."
+                        if ! $SILENT_MODE; then
+                            echo -e "${YELLOW}To upgrade system pip3, run: ${PURPLE}sudo apt-get install --only-upgrade python3-pip${NC}"
+                        fi
+                    fi
+                else
+                    info "Could not determine latest pip3 version from apt repositories or no updates available."
+                fi
+            elif [ "$package_manager" = "yum" ] || [ "$package_manager" = "dnf" ]; then
+                local upgradable_pip=$(sudo $package_manager list updates 2>/dev/null | grep -E "^python3-pip" | awk '{print $2}' | head -n 1 || echo "")
+                if [ -n "$upgradable_pip" ]; then
+                    warning "An update for pip3 (${upgradable_pip}) is available via $package_manager."
+                    if ! $SILENT_MODE; then
+                        echo -e "${YELLOW}To upgrade system pip3, run: ${PURPLE}sudo $package_manager update python3-pip${NC}"
+                    fi
+                else
+                    success "System pip3 is up to date in $package_manager repositories."
+                fi
+            elif [ "$package_manager" = "pacman" ]; then
+                local upgradable_pip=$(pacman -Qu 2>/dev/null | grep -E "^python-pip " | awk '{print $4}' | head -n 1 || echo "")
+                if [ -n "$upgradable_pip" ]; then
+                    warning "An update for pip3 (${upgradable_pip}) is available via pacman."
+                    if ! $SILENT_MODE; then
+                        echo -e "${YELLOW}To upgrade system pip3, run: ${PURPLE}sudo pacman -Syu${NC}"
+                    fi
+                else
+                    success "System pip3 is up to date in pacman repositories."
+                fi
+            fi
+        fi
+
+        # Suggest direct pip upgrade for the absolute latest from PyPI
+        if ! $SILENT_MODE; then
+            echo ""
+            info "To upgrade pip3 to the absolute latest version from PyPI (Python Package Index), run:"
+            echo -e "${PURPLE}  python3 -m pip install --upgrade pip${NC}"
+        fi
+    fi
+
+    echo ""
+    warning "System-wide Python/Pip updates can sometimes affect system tools. Use virtual environments for project-specific Python versions."
+    info "For managing multiple Python versions and the absolute latest releases without system-wide interference, consider using a tool like ${BLUE}pyenv${NC} (https://github.com/pyenv/pyenv)."
 }
 
 
@@ -396,12 +460,12 @@ show_help() {
     echo -e "  ${GREEN}delete <env_name>${NC}         - ${PURPLE}Delete a virtual environment.${NC}"
     echo -e "  ${GREEN}install <env_name> <file>${NC} - ${PURPLE}Install packages from a requirements file into an environment.${NC}"
     echo -e "  ${GREEN}export <env_name> <file>${NC}  - ${PURPLE}Export installed packages to a requirements.txt.${NC}"
-    echo -e "  ${GREEN}list${NC}                    - ${PURPLE}List all virtual environments.${NC}"
+    echo -e "  ${GREEN}list${NC}                        - ${PURPLE}List all virtual environments.${NC}"
     echo -e "  ${GREEN}activate <env_name>${NC}       - ${PURPLE}Display command to activate a virtual environment. Requires 'source'!${NC}"
-    echo -e "  ${GREEN}check-update-python${NC}       - ${PURPLE}Check if the system's Python 3 installation has updates.${NC}"
-    echo -e "  ${GREEN}-up, --up${NC}              - ${PURPLE}Alias for check-update-python.${NC}"
-    echo -e "  ${GREEN}--log${NC}                   - ${PURPLE}View the log file.${NC}"
-    echo -e "  ${GREEN}-h, --help${NC}              - ${PURPLE}Display this help message.${NC}"
+    echo -e "  ${GREEN}check-update-python${NC}       - ${PURPLE}Check if the system's Python 3 and pip3 installations have updates.${NC}"
+    echo -e "  ${GREEN}-check-update-python, --up${NC}              - ${PURPLE}Alias for check-update-python.${NC}"
+    echo -e "  ${GREEN}--log${NC}                     - ${PURPLE}View the log file.${NC}"
+    echo -e "  ${GREEN}-h, --help${NC}                - ${PURPLE}Display this help message.${NC}"
     echo ""
     echo -e "${YELLOW}Global Options:${NC}"
     echo -e "  ${GREEN}--path <storage_path>${NC} - ${PURPLE}Override default environment storage path for the command.${NC}"
@@ -411,7 +475,6 @@ show_help() {
     echo -e "${YELLOW}Defaults:${NC}"
     echo -e "  ${PURPLE}Default environment storage: ${CYAN}$DEFAULT_PYENV_STORAGE${NC}"
     echo -e "  ${PURPLE}Log file: ${CYAN}$LOG_FILE${NC}"
-    echo -e "  ${PURPLE}Configuration file: ${CYAN}$CONFIG_FILE${NC}"
     echo ""
     echo -e "${YELLOW}Examples:${NC}"
     echo -e "  $0 create myproject_env --path /var/py_envs --silent"
@@ -435,14 +498,13 @@ if [[ $? -ne 0 ]]; then
     # getopt automatically prints an error message
     show_help
     exit 1
-fi # <-- CORRECTED: This 'fi' was missing and caused the syntax error.
+fi
 
 # Eval the parsed options so they are processed correctly
 eval set -- "$PARSED_OPTIONS"
 
 # Process global options (like --silent, --force, --path) first
-# Initialize STORAGE_PATH with DEFAULT_PYENV_STORAGE temporarily.
-# This will be refined after load_config.
+# Initialize STORAGE_PATH with DEFAULT_PYENV_STORAGE.
 STORAGE_PATH="$DEFAULT_PYENV_STORAGE"
 STORAGE_PATH_OVERRIDE="" # To store explicit --path value
 
@@ -489,15 +551,10 @@ while true; do
     esac
 done
 
-# Now that SILENT_MODE is correctly set (from getopt parsing), load configuration.
-# This ensures messages from load_config respect the silent mode.
-load_config
-
-# Apply the --path override if it was provided, otherwise use the value from config or default.
+# Apply the --path override if it was provided, otherwise use the default.
 if [ -n "$STORAGE_PATH_OVERRIDE" ]; then
     STORAGE_PATH="$STORAGE_PATH_OVERRIDE"
 fi
-
 
 # Now, process the actual command
 COMMAND="${1:-}" # Get the command (or empty if none)
